@@ -41,7 +41,7 @@ import dev.osmcremote.TermEntry
 @Composable
 fun ToolsScreen(vm: AppViewModel) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
-    val tabs = listOf("Network", "Logs", "Terminal")
+    val tabs = listOf("Audio", "Network", "Logs", "Terminal")
     Column(Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tab) {
             tabs.forEachIndexed { i, t ->
@@ -49,8 +49,9 @@ fun ToolsScreen(vm: AppViewModel) {
             }
         }
         when (tab) {
-            0 -> NetworkTab(vm)
-            1 -> LogsTab(vm)
+            0 -> AudioTab(vm)
+            1 -> NetworkTab(vm)
+            2 -> LogsTab(vm)
             else -> TerminalTab(vm)
         }
     }

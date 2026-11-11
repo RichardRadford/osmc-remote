@@ -84,3 +84,34 @@ enum class LogSource(val label: String) {
 }
 
 enum class PowerAction { RestartKodi, StopKodi, StartKodi, Reboot, Shutdown }
+
+data class KodiVolume(val volume: Int, val muted: Boolean)
+
+data class KodiOption(val label: String, val value: Any)
+
+/** One Kodi setting as reported by JSON-RPC Settings.GetSettings. */
+data class KodiSetting(
+    val id: String,
+    val label: String,
+    val help: String,
+    val type: String,
+    val value: Any?,
+    val options: List<KodiOption>,
+    val min: Double?,
+    val max: Double?,
+    val step: Double?,
+    val enabled: Boolean,
+) {
+    val editable: Boolean
+        get() = when (type) {
+            "boolean" -> true
+            "integer", "number" -> options.isNotEmpty() || (min != null && max != null)
+            "string" -> options.isNotEmpty()
+            else -> false
+        }
+
+    fun sameValue(other: Any?): Boolean = value?.toString() == other?.toString()
+
+    val valueLabel: String
+        get() = options.firstOrNull { sameValue(it.value) }?.label ?: value?.toString().orEmpty()
+}

@@ -10,6 +10,7 @@ An Android app that manages an OSMC box (Raspberry Pi or Vero) over SSH, with a 
 | **Updates** | Checks the OSMC repositories and lists pending packages. Installs updates (`apt full-upgrade`) **detached on the device** with a live log, so closing the app doesn't interrupt the update. Offers a reboot when the update needs one |
 | **Config** | Pi: easy toggles and fields for common `config.txt` options (HDMI, overscan, CEC, GPU memory, overclocking, codec licences), written to `config-user.txt` when present. All devices: raw editor for any boot file. Every save makes a `.osmcremote.bak` backup first |
 | **Services** | Every systemd service with its status. Start, stop, restart, enable or disable at boot, and view each service's journal. Asks first before stopping SSH, ConnMan or Kodi |
+| **Tools → Audio** | Live Kodi volume and mute; default volume boost (amplification, 0–60 dB) for all media; every Kodi audio setting (output device, speaker layout, passthrough, volume steps, and so on), read live from Kodi and applied immediately |
 | **Tools → Network** | Adapters (turn Wi-Fi and Bluetooth on or off), IP addresses, Wi-Fi scan, connect with a password (via a ConnMan provisioning file) and disconnect |
 | **Tools → Logs** | Kodi log, system journal, kernel log and update log. Share any of them, or run OSMC's `grab-logs -A` to upload all logs and get a link for the forum |
 | **Tools → Terminal** | Runs single commands (optionally as root) with quick-command chips |

@@ -3,6 +3,9 @@ package dev.osmcremote
 import android.content.res.AssetManager
 import dev.osmcremote.ssh.ExecResult
 import dev.osmcremote.ssh.SshClient
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Locale
 
 /** Everything the app knows how to do on an OSMC box, expressed as shell commands. */
 class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
@@ -22,6 +25,7 @@ class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
     /** OSMC's `osmc` user has passwordless sudo by default; fall back to the login password. */
     suspend fun initSudo(pw: String) {
         password = pw
+        rpcHelperReady = false
         sudoMode = when {
             ssh.exec("sudo -n true").ok -> SudoMode.NoPassword
             ssh.exec("sudo -S -p '' true", pw + "\n").ok -> SudoMode.Password
@@ -276,7 +280,125 @@ class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
         return url ?: throw OsmcException("Log upload failed: " + r.combined.takeLast(300))
     }
 
+    // ---------------------------------------------------------------- Kodi audio
+
+    private var rpcHelperReady = false
+
+    /**
+     * Calls Kodi's JSON-RPC API from the device itself: first over the local TCP
+     * port 9090 (via a small Python helper), then over HTTP on 127.0.0.1:8080.
+     */
+    suspend fun kodiRpc(method: String, params: JSONObject = JSONObject()): Any? {
+        if (!rpcHelperReady) {
+            writeUserFile(RPC_HELPER, script("kodirpc.py"))
+            rpcHelperReady = true
+        }
+        val req = JSONObject()
+            .put("jsonrpc", "2.0")
+            .put("id", 1)
+            .put("method", method)
+            .put("params", params)
+            .toString()
+        var r = ssh.exec("python3 $RPC_HELPER", req)
+        if (!r.ok || !r.out.trim().startsWith("{")) {
+            val http = ssh.exec(
+                "curl -s -m 8 -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:8080/jsonrpc",
+                req,
+            )
+            if (http.ok && http.out.trim().startsWith("{")) {
+                r = http
+            } else {
+                throw OsmcException(
+                    "Couldn't reach Kodi. Check that Kodi is running and that, in Kodi, " +
+                        "Settings → Services → Control → “Allow remote control from applications on this system” is on."
+                )
+            }
+        }
+        val obj = JSONObject(r.out.trim())
+        obj.optJSONObject("error")?.let { throw OsmcException("Kodi said: " + it.optString("message")) }
+        return obj.opt("result")
+    }
+
+    suspend fun kodiVolume(): KodiVolume {
+        val res = kodiRpc(
+            "Application.GetProperties",
+            JSONObject().put("properties", JSONArray(listOf("volume", "muted"))),
+        ) as? JSONObject ?: throw OsmcException("Kodi returned no volume")
+        return KodiVolume(res.optInt("volume"), res.optBoolean("muted"))
+    }
+
+    suspend fun setKodiVolume(volume: Int) {
+        kodiRpc("Application.SetVolume", JSONObject().put("volume", volume.coerceIn(0, 100)))
+    }
+
+    suspend fun setKodiMute(mute: Boolean) {
+        kodiRpc("Application.SetMute", JSONObject().put("mute", mute))
+    }
+
+    /** Every setting in Kodi's Settings → System → Audio, at expert level. */
+    suspend fun kodiAudioSettings(): List<KodiSetting> {
+        val res = kodiRpc(
+            "Settings.GetSettings",
+            JSONObject()
+                .put("level", "expert")
+                .put("filter", JSONObject().put("section", "system").put("category", "audio")),
+        ) as? JSONObject ?: return emptyList()
+        val arr = res.optJSONArray("settings") ?: return emptyList()
+        val out = mutableListOf<KodiSetting>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val opts = mutableListOf<KodiOption>()
+            o.optJSONArray("options")?.let { oa ->
+                for (j in 0 until oa.length()) {
+                    val opt = oa.optJSONObject(j) ?: continue
+                    val v = opt.opt("value") ?: continue
+                    opts += KodiOption(opt.optString("label", v.toString()), v)
+                }
+            }
+            out += KodiSetting(
+                id = o.optString("id"),
+                label = o.optString("label", o.optString("id")),
+                help = o.optString("help", ""),
+                type = o.optString("type"),
+                value = o.opt("value"),
+                options = opts,
+                min = if (o.has("minimum")) o.optDouble("minimum") else null,
+                max = if (o.has("maximum")) o.optDouble("maximum") else null,
+                step = if (o.has("step")) o.optDouble("step") else null,
+                enabled = o.optBoolean("enabled", true),
+            )
+        }
+        return out
+    }
+
+    suspend fun setKodiSetting(s: KodiSetting, value: Any) {
+        val typed: Any = when (s.type) {
+            "boolean" -> value as? Boolean ?: value.toString().toBoolean()
+            "integer" -> (value as? Number)?.toInt() ?: value.toString().toDouble().toInt()
+            "number" -> (value as? Number)?.toDouble() ?: value.toString().toDouble()
+            else -> value.toString()
+        }
+        kodiRpc("Settings.SetSettingValue", JSONObject().put("setting", s.id).put("value", typed))
+    }
+
+    /** Default volume amplification in dB (Kodi's "Set as default for all media"). Null if never saved. */
+    suspend fun amplification(): Double? =
+        ssh.exec("sh -s get", script("amp.sh")).out.trim().toDoubleOrNull()
+
+    /** Kodi rewrites its settings file on exit, so it is stopped while the file is edited. */
+    suspend fun setAmplification(db: Double) {
+        val wasRunning = run("systemctl is-active mediacenter").out.trim() == "active"
+        if (wasRunning) sudo("systemctl stop mediacenter").orThrow("Stopping Kodi")
+        try {
+            val value = String.format(Locale.US, "%.6f", db.coerceIn(0.0, 60.0))
+            ssh.exec("sh -s set " + q(value), script("amp.sh")).orThrow("Saving the boost")
+        } finally {
+            if (wasRunning) sudo("systemctl start mediacenter")
+        }
+    }
+
     companion object {
+        const val RPC_HELPER = "/tmp/osmcremote-kodirpc.py"
         const val UPGRADE_SCRIPT = "/tmp/osmcremote-upgrade.sh"
         const val UPGRADE_LOG = "/tmp/osmcremote-upgrade.log"
         const val EDIT_TMP = "/tmp/osmcremote-edit.tmp"
