@@ -72,6 +72,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     private var upgradeJob: Job? = null
 
+    // Package install/remove job (Services → Add / Remove)
+    val pkgLog = mutableStateListOf<String>()
+    var pkgTitle by mutableStateOf("")
+        private set
+    var pkgRunning by mutableStateOf(false)
+        private set
+    var pkgExitCode by mutableStateOf<Int?>(null)
+        private set
+    var pkgDialogVisible by mutableStateOf(false)
+    private var pkgJob: Job? = null
+
     val terminal = mutableStateListOf<TermEntry>()
     private var termId = 0L
 
@@ -120,6 +131,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnect(message: String? = null) {
         viewModelScope.launch {
             upgradeJob?.cancel()
+            pkgJob?.cancel()
             withContext(Dispatchers.IO) { ssh.disconnectNow() }
             _conn.value = ConnState.Idle(message)
         }
@@ -214,6 +226,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun startUpgrade() {
         if (upgradeJob?.isActive == true) return
+        if (pkgJob?.isActive == true) {
+            toast("A package install or removal is still running. Wait for it to finish.")
+            return
+        }
         upgradeLog.clear()
         upgradeExitCode = null
         upgradeNeedsReboot = false
@@ -262,6 +278,63 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 upgradeLog.add(line)
                 if (upgradeLog.size > 5000) repeat(500) { upgradeLog.removeAt(0) }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- packages
+
+    fun startPackageJob(title: String, install: List<String>, remove: List<String>) {
+        if (pkgJob?.isActive == true || upgradeJob?.isActive == true) {
+            toast("Another install or update is still running. Wait for it to finish.")
+            return
+        }
+        pkgJob = launchOp {
+            if (osmc.isAptBusy()) {
+                toast("An update or install is already running on the device. Try again when it finishes.")
+                return@launchOp
+            }
+            pkgLog.clear()
+            pkgExitCode = null
+            pkgTitle = title
+            pkgDialogVisible = true
+            pkgRunning = true
+            try {
+                osmc.startPackageJob(install, remove)
+                osmc.followPackageJob { line ->
+                    viewModelScope.launch(Dispatchers.Main) { onPkgLine(line) }
+                }
+            } finally {
+                pkgRunning = false
+            }
+        }
+    }
+
+    /** Re-show a package job that's still running on the device (e.g. after the app was closed). */
+    fun reattachPackageJob() {
+        if (pkgJob?.isActive == true) return
+        pkgJob = launchOp {
+            if (osmc.isPackageJobRunning()) {
+                pkgLog.clear()
+                pkgExitCode = null
+                if (pkgTitle.isBlank()) pkgTitle = "Package changes in progress"
+                pkgRunning = true
+                try {
+                    osmc.followPackageJob { line ->
+                        viewModelScope.launch(Dispatchers.Main) { onPkgLine(line) }
+                    }
+                } finally {
+                    pkgRunning = false
+                }
+            }
+        }
+    }
+
+    private fun onPkgLine(line: String) {
+        if (line.startsWith(Osmc.DONE_MARKER)) {
+            pkgExitCode = line.removePrefix(Osmc.DONE_MARKER).trim().toIntOrNull() ?: 1
+        } else {
+            pkgLog.add(line)
+            if (pkgLog.size > 5000) repeat(500) { pkgLog.removeAt(0) }
         }
     }
 

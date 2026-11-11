@@ -120,19 +120,158 @@ class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
         return UpdateCheck(pkgs, warnings)
     }
 
-    suspend fun startUpgrade() {
-        writeUserFile(UPGRADE_SCRIPT, script("upgrade.sh"))
-        sudo(
-            "rm -f $UPGRADE_LOG; " +
-                "setsid nohup sh $UPGRADE_SCRIPT > $UPGRADE_LOG 2>&1 < /dev/null &"
-        ).orThrow("Starting the update")
+    // Long-running root jobs (apt) run detached on the device with setsid + nohup,
+    // logging to /tmp/osmcremote-<name>.log, so they survive the app disconnecting.
+    // Scripts end by printing "__OSMCREMOTE_DONE__ <exit code>".
+
+    private suspend fun startDetached(name: String, scriptText: String, what: String) {
+        val sh = "/tmp/osmcremote-$name.sh"
+        val log = "/tmp/osmcremote-$name.log"
+        writeUserFile(sh, scriptText)
+        sudo("rm -f $log; setsid nohup sh $sh > $log 2>&1 < /dev/null &").orThrow(what)
     }
 
-    suspend fun isUpgradeRunning(): Boolean =
-        run("pgrep -f '[o]smcremote-upgrade.sh' >/dev/null && echo yes").out.trim() == "yes"
+    private suspend fun isDetachedRunning(name: String): Boolean =
+        run("pgrep -f '[o]smcremote-$name.sh' >/dev/null && echo yes").out.trim() == "yes"
 
-    suspend fun followUpgrade(onLine: (String) -> Unit): Int =
-        ssh.stream("tail -n +1 -F $UPGRADE_LOG 2>/dev/null", onLine) { it.startsWith(DONE_MARKER) }
+    private suspend fun followDetached(name: String, onLine: (String) -> Unit): Int =
+        ssh.stream("tail -n +1 -F /tmp/osmcremote-$name.log 2>/dev/null", onLine) { it.startsWith(DONE_MARKER) }
+
+    /** True while any apt job started by this app is still running on the device. */
+    suspend fun isAptBusy(): Boolean = isDetachedRunning("upgrade") || isDetachedRunning("pkg")
+
+    suspend fun startUpgrade() = startDetached("upgrade", script("upgrade.sh"), "Starting the update")
+    suspend fun isUpgradeRunning(): Boolean = isDetachedRunning("upgrade")
+    suspend fun followUpgrade(onLine: (String) -> Unit): Int = followDetached("upgrade", onLine)
+
+    // ---------------------------------------------------------------- packages (add / remove services)
+
+    /** OSMC App Store items are ordinary packages named like "tvheadend-app-osmc". */
+    suspend fun appStore(): List<AppPackage> {
+        val avail = run("apt-cache search --names-only 'app-osmc' 2>/dev/null").out
+        val installed = run(
+            "dpkg-query -W -f='\${db:Status-Abbrev} \${Package}\\n' '*app-osmc*' 2>/dev/null"
+        ).out.lines()
+            .filter { it.startsWith("ii") }
+            .map { it.trim().split(Regex("\\s+")).last() }
+            .toSet()
+        val list = avail.lines().mapNotNull { line ->
+            val name = line.substringBefore(" - ").trim()
+            if (name.isEmpty() || !name.contains("app-osmc")) null
+            else AppPackage(name, line.substringAfter(" - ", "").trim(), name in installed)
+        }
+        // installed apps whose package lists are stale still show up
+        val extra = installed.filter { n -> list.none { it.name == n } }.map { AppPackage(it, "", true) }
+        return (list + extra).sortedBy { it.displayName.lowercase() }
+    }
+
+    suspend fun packageExists(pkg: String): Boolean {
+        checkPackageName(pkg)
+        return run("apt-cache show " + q(pkg) + " >/dev/null 2>&1 && echo yes").out.trim() == "yes"
+    }
+
+    suspend fun isInstalled(pkg: String): Boolean =
+        run("dpkg-query -W -f='\${db:Status-Abbrev}' " + q(pkg) + " 2>/dev/null").out.startsWith("ii")
+
+    /** Asks apt what removing [pkg] would also remove, and flags anything the app must not touch. */
+    suspend fun planRemoval(pkg: String): RemovalPlan {
+        checkPackageName(pkg)
+        val r = run("LANG=C apt-get -s remove " + q(pkg) + " 2>&1")
+        val removed = r.out.lines()
+            .filter { it.startsWith("Remv ") }
+            .map { it.removePrefix("Remv ").substringBefore(' ') }
+        if (removed.isEmpty()) {
+            throw OsmcException(
+                if (r.ok) "$pkg isn't installed." else "apt couldn't plan the removal: " + r.combined.takeLast(300)
+            )
+        }
+        return RemovalPlan(removed, removed.filter { isProtectedPackage(it) })
+    }
+
+    suspend fun startPackageJob(install: List<String>, remove: List<String>) {
+        (install + remove).forEach { checkPackageName(it) }
+        val opts = "-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+        val text = buildString {
+            append("#!/bin/sh\nexport DEBIAN_FRONTEND=noninteractive\nrc=0\n")
+            if (install.isNotEmpty()) {
+                append("echo '== Refreshing package lists =='\napt-get update\necho\n")
+                append("echo '== Installing ").append(install.joinToString(" ")).append(" =='\n")
+                append("apt-get $opts install ").append(install.joinToString(" ") { q(it) }).append(" || rc=\$?\n")
+            }
+            if (remove.isNotEmpty()) {
+                append("echo '== Removing ").append(remove.joinToString(" ")).append(" =='\n")
+                append("apt-get $opts remove ").append(remove.joinToString(" ") { q(it) }).append(" || rc=\$?\n")
+            }
+            append("systemctl daemon-reload\n")
+            append("echo \"$DONE_MARKER \$rc\"\n")
+        }
+        startDetached("pkg", text, "Starting the package job")
+    }
+
+    suspend fun isPackageJobRunning(): Boolean = isDetachedRunning("pkg")
+    suspend fun followPackageJob(onLine: (String) -> Unit): Int = followDetached("pkg", onLine)
+
+    // ---------------------------------------------------------------- custom services
+
+    /** Where a service's unit file comes from, which decides how it can be removed. */
+    suspend fun serviceOrigin(unit: String): ServiceOrigin {
+        val path = run("systemctl show -p FragmentPath --value " + q(unit)).out.trim()
+        if (path.isEmpty()) return ServiceOrigin.Unknown("systemd doesn't report a unit file for it.")
+        if (path == "/dev/null") return ServiceOrigin.Unknown("It's masked.")
+        val alt = when {
+            path.startsWith("/usr/lib/") -> path.removePrefix("/usr")
+            path.startsWith("/lib/") -> "/usr$path"
+            else -> path
+        }
+        val owner = run(
+            "for p in " + q(path) + " " + q(alt) + "; do dpkg -S \"\$p\" 2>/dev/null && break; done | head -n 1"
+        ).out.trim()
+        if (owner.contains(": ")) {
+            val pkg = owner.substringBefore(": ").split(", ").first().trim()
+            return ServiceOrigin.Package(pkg, path)
+        }
+        if (path.startsWith("/etc/systemd/system/")) {
+            val ours = run("grep -q " + q(CUSTOM_MARKER) + " " + q(path) + " && echo yes").out.trim() == "yes"
+            return ServiceOrigin.UnitFile(path, ours)
+        }
+        return ServiceOrigin.Unknown("Its unit file ($path) doesn't belong to any package.")
+    }
+
+    suspend fun readCustomService(unit: String): CustomService {
+        val text = run("cat " + q("/etc/systemd/system/$unit")).orThrow("Reading $unit").out
+        return CustomService.parse(unit.removeSuffix(".service"), text)
+    }
+
+    suspend fun saveCustomService(svc: CustomService, isNew: Boolean, enable: Boolean, startNow: Boolean) {
+        svc.validate()?.let { throw OsmcException(it) }
+        val unit = svc.unitName
+        val dest = "/etc/systemd/system/$unit"
+        if (isNew) {
+            val exists = run("systemctl cat " + q(unit) + " >/dev/null 2>&1 && echo yes; [ -e " + q(dest) + " ] && echo yes")
+            if (exists.out.contains("yes")) throw OsmcException("A service called ${svc.name} already exists.")
+        }
+        if (svc.user != "root") {
+            if (!run("id -u " + q(svc.user)).ok) throw OsmcException("There's no user called ${svc.user} on the device.")
+        }
+        writeUserFile(UNIT_TMP, svc.toUnitFile())
+        sudo(
+            "install -m 644 -o root -g root $UNIT_TMP " + q(dest) + " && rm -f $UNIT_TMP && systemctl daemon-reload"
+        ).orThrow("Saving $unit")
+        sudo("systemctl " + (if (enable) "enable " else "disable ") + q(unit)).orThrow(if (enable) "Enabling at boot" else "Disabling at boot")
+        if (startNow) {
+            sudo("systemctl restart " + q(unit)).orThrow("Starting $unit")
+        }
+    }
+
+    /** Stops, disables and deletes a unit file in /etc/systemd/system (a copy is kept as .osmcremote.bak). */
+    suspend fun deleteUnitFile(unit: String, path: String) {
+        require(path.startsWith("/etc/systemd/system/") && path.endsWith(".service"))
+        sudo(
+            "systemctl disable --now " + q(unit) + " 2>/dev/null; " +
+                "cp " + q(path) + " " + q("$path.osmcremote.bak") + " && rm -f " + q(path) + " && systemctl daemon-reload"
+        ).orThrow("Deleting $unit")
+        sudo("systemctl reset-failed " + q(unit) + " 2>/dev/null")
+    }
 
     // ---------------------------------------------------------------- boot config
 
@@ -166,11 +305,13 @@ class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
         val r = ssh.exec("sh -s", script("services.sh"))
         val files = HashMap<String, String>()
         val units = HashMap<String, Pair<String, String>>()
+        val custom = HashSet<String>()
         for (line in r.out.lines()) {
             val p = line.trim().split(Regex("\\s+"))
             when (p.getOrNull(0)) {
                 "F" -> if (p.size >= 3) files[p[1]] = p[2]
                 "U" -> if (p.size >= 4) units[p[1]] = p[2] to p[3]
+                "C" -> if (p.size >= 2) custom += p[1]
             }
         }
         return (files.keys + units.keys)
@@ -182,6 +323,7 @@ class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
                     unitFileState = files[n] ?: "static",
                     active = units[n]?.first ?: "inactive",
                     sub = units[n]?.second ?: "dead",
+                    custom = n in custom,
                 )
             }
             .sortedBy { it.name }
@@ -404,6 +546,24 @@ class Osmc(private val ssh: SshClient, private val assets: AssetManager) {
         const val EDIT_TMP = "/tmp/osmcremote-edit.tmp"
         const val DONE_MARKER = "__OSMCREMOTE_DONE__"
         const val REBOOT_MARKER = "__OSMCREMOTE_REBOOT__"
+
+        const val UNIT_TMP = "/tmp/osmcremote-unit.tmp"
+        const val CUSTOM_MARKER = "Created by OSMC Remote"
+
+        private val PACKAGE_NAME = Regex("^[a-z0-9][a-z0-9+.-]+(:[a-z0-9]+)?$")
+
+        /** Packages whose removal would break the device or cut off this SSH connection. */
+        private val PROTECTED = Regex(
+            "mediacenter|systemd|dbus|connman|ssh|sudo|udev|base-files|libc6|^apt|dpkg|kernel|" +
+                "firmware|bootloader|coreutils|util-linux|login|^init|bash|^dash|python3|osmc-release|" +
+                "diskmount|wpasupplicant|network"
+        )
+
+        fun isProtectedPackage(pkg: String): Boolean = PROTECTED.containsMatchIn(pkg)
+
+        fun checkPackageName(pkg: String) {
+            if (!PACKAGE_NAME.matches(pkg)) throw OsmcException("“$pkg” isn't a valid package name.")
+        }
 
         /** Single-quote a string for POSIX sh. */
         fun q(s: String): String = "'" + s.replace("'", "'\"'\"'") + "'"
